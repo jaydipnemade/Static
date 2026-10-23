@@ -1,0 +1,527 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Contact Grabber Proposal Pack</title>
+<style>
+:root{--bg:#fff;--fg:#1d2327;--mut:#5b6670;--line:#d9dee3;--code:#f3f5f7;--acc:#1f8f89}
+@media (prefers-color-scheme:dark){:root{--bg:#14181b;--fg:#e6eaed;--mut:#9aa6af;--line:#2c3439;--code:#1d2328;--acc:#4cc2bb}}
+body{background:var(--bg);color:var(--fg);font:16px/1.6 system-ui,-apple-system,Segoe UI,sans-serif;margin:0}
+main{max-width:920px;margin:0 auto;padding:24px 16px 80px}
+h1{font-size:1.8rem;border-bottom:2px solid var(--acc);padding-bottom:.3em;margin-top:2.5em}
+h1:first-child{margin-top:0}h2{margin-top:2em}h3{margin-top:1.6em}
+a{color:var(--acc)}code{background:var(--code);padding:.1em .35em;border-radius:4px;font-size:.9em}
+pre{background:var(--code);padding:12px;border-radius:6px;overflow:auto}pre code{background:none;padding:0}
+table{border-collapse:collapse;display:block;overflow-x:auto;margin:1em 0}
+th,td{border:1px solid var(--line);padding:6px 10px;text-align:left;vertical-align:top}th{background:var(--code)}
+hr{border:0;border-top:1px solid var(--line);margin:2.5em 0}
+.mermaid{background:var(--code);padding:12px;border-radius:6px;overflow:auto;text-align:center}
+#err{color:#b00020}
+@media print{main{max-width:none}h1{page-break-before:always}h1:first-child{page-break-before:auto}}
+</style></head><body><main id="out"><p id="err">Loading… (needs an internet connection to render; the Markdown file has the same content.)</p></main>
+<script id="src" type="text/markdown"># Contact Grabber: finding contacts on any website
+
+**Proposal pack for review** · prepared 2026-10-23
+
+## Summary
+
+**Problem.** The extension finds contacts on a page using hand-written rules about how pages are laid out. That works on pages
+that look like the ones the rules were written for. It fails on LinkedIn, Facebook, marketing sites and any site we have not
+seen, and every fix adds another rule that the next redesign breaks. Saving the contact once it is found works well; the
+weak part is *reading the page*.
+
+**Proposal.** Keep the click-only trigger, the panel and the save flow. Change how contacts are found:
+
+1. The extension collects the page's visible text, the open popup/modal, links and structured data from every frame.
+2. The existing `grabber-gate` service sends that to a Claude model (Haiku 5.5), which returns contacts in our fields.
+3. The gate throws away any field that is not actually on the page, so nothing is invented.
+4. The user reviews and edits the result in the existing form before saving. If the server is down, over quota or the user has
+   not consented, the current scanner still runs.
+
+**Cost.** About **$0.0017 per scan** on Haiku 5.5. At 10,000 active users scanning 15 times a month: about **$260 / month** for
+the model plus about $36 for hosting. Worst-case spend per account is capped by a daily quota: about $4 / month (free) and
+$40 / month (paid). Sonnet would cost about 20x more and is only a fallback for page types Haiku handles poorly.
+
+**What changes outside the extension.** An Anthropic workspace and key (in Secrets Manager), a new LookingGlass route with a
+256 KB body and 30 s timeout, a second gate task, two small database tables, alerts, and a privacy-policy and Web Store
+disclosure update (page text is sent to our server and a model provider, with a one-time consent screen).
+
+**Risks.** Invented data (controlled by the grounding check), cost (quota, caps, spend limit, kill switch), privacy (consent,
+no storage, disclosure), provider outage (falls back to the current scanner). Some pages will still fail: contact-form-only
+pages, details visible only to logged-in connections, text inside images.
+
+## Decisions needed from you
+
+1. Approve the approach: model-based extraction through the gate, with the current scanner as fallback.
+2. Approve sending page text to our backend and the model provider (privacy policy and Web Store disclosure update).
+3. Choose the provider route: direct Claude API now (recommended) or Amazon Bedrock.
+4. Set the monthly spend ceiling and confirm the daily quotas (20 free / 200 paid are placeholders).
+5. Name owners for: the Anthropic account and key, the LookingGlass route and limits, and the AWS secret, IAM and network checks.
+6. Supply real active-user and scans-per-user numbers so the cost tables can be replaced with real figures.
+
+## What is in this pack
+
+| Part | Document | Read it for |
+|---|---|---|
+| 1 | Current approach vs the approach to use | The recommendation and the side-by-side comparison |
+| 2 | Where normal scraping fails, and better ways | Why more rules cannot fix this, and what else can help |
+| 3 | The extraction model service: build, cost, infrastructure | Model choice, call design, per-scan and monthly cost, infra changes, phases, risks |
+
+Detailed design and the task-by-task implementation plan are separate files:
+`docs/superpowers/specs/2026-10-23-model-extraction-design.md` and
+`docs/superpowers/plans/2026-10-23-model-extraction.md`.
+
+*Estimates (token counts, scans per user, effort, hosting prices) are assumptions to be replaced with measured values. Model
+prices are Anthropic list prices as of 2026-10-06; confirm before budgeting.*
+
+---
+
+# Part 1: Current approach vs the approach to use
+
+Why this exists: the extension fails to find or save contacts on many pages (LinkedIn, Facebook, marketing sites). This
+compares how it works today with the approach we should move to. Detail lives in
+`docs/scanner-and-parser.md` (today), `docs/where-scraping-fails.md` (why rules fail),
+`docs/superpowers/specs/2026-10-23-model-extraction-design.md` (the design) and
+`docs/superpowers/plans/2026-10-23-model-extraction.md` (the build plan).
+
+## 1. The current approach: rules about the page
+
+```mermaid
+flowchart LR
+  C["User clicks icon,\nScan, or highlights"] --> I["Inject grab.js\ninto the top frame only"]
+  I --> S["scanPage(): rules, run once"]
+  S --> A["1. JSON-LD / schema.org / vCard"]
+  S --> B["2. Cards: repeated listings,\nread by class and id words"]
+  S --> L["3. mailto: and tel: links"]
+  S --> T["4. Page text cut into chunks,\nparsed with regex-style rules"]
+  A & B & L & T --> M["Merge by shared email/phone,\nrank, show in panel"]
+  M --> F["User reviews form → Save\n(gate → Contacts API)"]
+```
+
+- **Trigger:** a click (`activeTab`), so the extension reads a page only when the user asks.
+- **Reading:** about 2,400 lines of rules (`src/scan/`, `src/parser/`) decide which text is a name, a company, a phone or an
+  address, using class names, labels, link types and text patterns. Gmail and Outlook have special adapters.
+- **Saving:** works well. The gate counts the free saves, creates the contact, then the tag, note and reminder are added as
+  separate retryable steps.
+
+**Where it breaks**
+- Rules are written per page shape. LinkedIn and Facebook class names are generated and change; marketing sites each look
+  different. Every new failure needs another rule, and the history of the repo is mostly that.
+- Only the top frame is read, so details in iframes are never seen.
+- The page is scanned once, immediately, so late-loading content and opened modals can be missed.
+- Spelled-out or encoded emails, other languages and name orders, and unusual layouts defeat the patterns.
+- Every failure shows as "unreadable" or "nothing found", so neither the user nor we know why.
+
+## 2. The approach to use: read the page, let a model structure it, verify it
+
+```mermaid
+flowchart LR
+  C["User clicks icon,\nScan, or highlights"] --> K["Collect from every frame:\nvisible text, open modal,\nlinks, JSON-LD, meta, selection\n(after the page settles)"]
+  K --> LOC["Run the current local scan\nas well (always kept)"]
+  K --> G["Gate: POST /v1/grabber/extract"]
+  G --> MOD["Model returns contacts\nin our fields"]
+  MOD --> GR["Grounding check: drop every\nfield not found on the page"]
+  GR --> MG["Merge with local result\n(local emails/phones win)"]
+  LOC --> MG
+  MG --> R["Panel: review and edit → Save\n(unchanged save flow)"]
+```
+
+What changes: **how contacts are found.** What stays: the click-only trigger, the panel, the form, matching, and the save flow.
+
+1. **Collect text, not markup.** The visible text, links, structured data and meta tags of the page and every frame, plus the
+   open modal in its own field. Class names do not matter, so a site redesign does not break it.
+2. **A model structures it.** One method for every site, including ones we have never seen, and for other languages, name
+   orders and odd layouts.
+3. **Verify, so nothing is invented.** The gate drops any field whose value is not actually on the page. Emails, phones,
+   websites and social links must appear verbatim; names and addresses must have every word on the page.
+4. **Keep the local scan.** If the gate is down, over quota, or the user has not consented, they still get today's result,
+   with a note.
+5. **The user decides.** Everything lands in the editable form before saving. Highlight, right-click and the paste box stay
+   as the manual path for pages nothing can read.
+6. **Say why it failed.** Distinct reasons: blocked page, nothing found, sign-in wall, smart reading unavailable, quota reached.
+
+## 3. Side by side
+
+| | Current (rules) | New (model + verify) |
+|---|---|---|
+| Works on a page we have never seen | Only if it looks like a known shape | Yes, same method everywhere |
+| LinkedIn / Facebook / marketing sites | Fragile; breaks on redesigns | Reads visible text; unaffected by class names |
+| Iframes | Not read | Read, subject to the Chrome permission check (plan Task 1) |
+| Late-loading content, open modals | Scanned once, may miss | Waits for the page to settle; open modal read first |
+| Other languages, name order | Label-based rules fail | Handled by the model |
+| Invented data risk | None (rules only copy) | Controlled by the grounding check |
+| Cost per scan | Free | A model call, capped by a per-plan daily quota |
+| Privacy | Page never leaves the browser | Page text goes to our gate and the model provider; needs consent, a policy update, no storage |
+| If the server is down | n/a | Falls back to the current scan |
+| Effort to fix a failing site | New rules, new fixtures, often fragile | Add the page to the test set; tune the prompt once for all |
+
+## 4. Why not the alternatives
+
+- **More rules or per-site adapters:** this is today's approach. It cannot keep up with unknown sites and changing markup.
+- **Converting the page to a PDF first:** the page is already text; a PDF only loses links and structured data.
+- **On-device model:** better privacy, but weaker, inconsistent across machines and slower to roll out. Kept as a possible
+  optional mode later.
+- **Crawling or auto-clicking:** breaks LinkedIn and Facebook terms and risks users' accounts. We read only the page the user
+  has open, on their click.
+
+## 5. Costs and limits to accept
+
+- Page text is sent to our backend and a model provider: a privacy-policy and Web Store disclosure change, a one-time consent
+  screen, and no storage of page text (logs hold counts and outcome codes only).
+- A model call costs money: daily caps (20 free, 200 paid, configurable), a size limit per request, no model call for
+  selections the local parser already reads, and a kill switch.
+- Some pages will still fail: contact-form-only pages, details visible only to connections the user does not have, text inside
+  images, and anything behind a login wall. The panel will say so instead of showing a generic error.
+
+
+---
+
+# Part 2: Where normal scraping fails, and better ways
+
+"Normal scraping" here means finding contact details with rules about the page: CSS selectors, class names, a fixed
+layout, or regexes over the page text. That is what `src/scan/` does today (cards, roles, links, text rules). It works on
+pages that look like the ones the rules were written for and fails on the rest. This explains why, and what to do instead.
+It supports `docs/superpowers/specs/2026-10-23-model-extraction-design.md`.
+
+## 1. Where rules fail
+
+### A. The markup is not stable or not meaningful
+
+| Case | Why rules fail |
+|---|---|
+| **LinkedIn, Facebook, Instagram** | Class names are machine-generated and change between deploys (`x1lliihq`, `_a9zs`). Selectors written today break within weeks. Text order and labels also differ per profile type (person, company page, group). |
+| **Marketing / builder sites** (Wix, Webflow, Squarespace, WordPress page builders) | Every site is laid out differently. A name might be an `h2`, a `span`, or a background image caption. No shared structure. |
+| **A/B tests and personalisation** | The same URL shows different markup to different visitors. A rule that passes in testing misses in production. |
+| **Other languages and scripts** | Labels ("Tel.", "Téléphone", "电话"), right-to-left text, name order (family name first) and address formats break label-based rules. |
+
+### B. The content is not in the DOM when the scan runs
+
+| Case | Why rules fail |
+|---|---|
+| **Single-page apps that render late** | The scan runs on click; the contact block appears 1-3 seconds after load, or only after scrolling. |
+| **Virtualised lists** (LinkedIn search results, Facebook member lists, big directories) | Only the rows on screen exist in the DOM. A scan sees 8 of 400 people. |
+| **Infinite scroll and "Load more"** | The rest of the list is not on the page until something loads it. |
+| **Click-to-reveal details** ("Show phone number", LinkedIn "Contact info") | The number or email is fetched only when clicked. Nothing to scrape until then. |
+
+### C. The content is in a place a scraper cannot reach
+
+| Case | Why rules fail |
+|---|---|
+| **Cross-origin iframes** (embedded widgets, CRM forms, map popups) | The content script runs in the top frame only, and browsers block reading another origin's frame. |
+| **Closed shadow DOM** | Web components can hide their contents from any script on the page. |
+| **Text inside images, canvas or SVG** (email as a picture, scanned business cards, text in a hero banner) | There is no text to read. |
+| **PDFs and embedded viewers** | The page is a viewer, not text. Chrome blocks extensions on some PDF viewers. |
+| **Blocked pages** (`chrome://`, the Web Store) | Chrome refuses to run extensions there at all. |
+
+### D. The site deliberately hides it
+
+| Case | Why rules fail |
+|---|---|
+| **Obfuscated emails** (`name [at] site [dot] com`, JavaScript-assembled addresses, Cloudflare's `data-cfemail` encoding) | A regex for `x@y.z` never matches the visible text. |
+| **Contact forms only** | There is no email or phone on the page, by design. |
+| **Login walls and paywalls** | The scan of the logged-out page finds a login form, not a person. |
+| **Bot detection** | Server-side fetching (a crawler) is blocked or served fake pages. Another reason not to crawl. |
+
+### E. Terms and ethics (not a technical limit)
+
+LinkedIn and Facebook terms forbid automated scraping, and both restrict contact data tightly (LinkedIn shows emails and
+phones only to connections; Facebook shows personal details only to friends). Large-scale or automated collection can get
+users' accounts restricted and creates privacy-law exposure (GDPR, CCPA). Reading the page the user is looking at, on their
+own click, with their own login, is different from a crawler, and the design keeps strictly to the first.
+
+## 2. Better ways
+
+Ordered by how well each works across many sites. Items marked **in plan** are covered by
+`docs/superpowers/plans/2026-10-23-model-extraction.md`; the rest are not yet and are suggestions.
+
+| Approach | Fixes | Notes |
+|---|---|---|
+| **Read the rendered, visible text instead of the markup** (`innerText`, headings, link text) | A, parts of B | Independent of class names, so it survives redesigns. **In plan** (the bundle). |
+| **Have a model read that text** and return structured contacts, then verify each field exists on the page | A, D (spelled-out emails), E | One approach for all sites; handles names, titles, languages, odd layouts. The grounding check stops invented values. **In plan.** |
+| **Use the page's own structured data first** (JSON-LD `Person`/`Organization`, microdata, `vcard`, `mailto:`/`tel:`, `og:` and `profile:` meta) | A | Free, exact and cheap when present. **In plan** (bundle `structured`, `links`, `meta`). |
+| **Read every frame** | C (iframes) | **In plan**, subject to the Task 1 permission check. |
+| **Wait for the page to settle, then read** | B (late render) | **In plan** (`waitForSettle`). |
+| **Let the user trigger the reveal, then scan again** | B (click-to-reveal) | Do not auto-click "show number" (it can count as automation and may alert the site). Instead tell the user "Click 'Contact info', then press Scan again". The existing "Contact info window" scan already reads the revealed popup. Suggested: a one-line hint in the panel when the page text mentions "contact info". |
+| **Decode known obfuscation** (Cloudflare `data-cfemail`, `[at]`/`(dot)`, HTML entities) | D | Small deterministic step before the model; a few lines of code. Suggested, cheap. |
+| **Screenshot + vision model** of the visible tab | C (images/canvas), some D | Chrome's `tabs.captureVisibleTab` works with `activeTab`. It reads text in images and heavily styled banners, at higher cost and with the same privacy disclosure as text. Suggested as a fallback when text is nearly empty and an image is likely. **Not in plan.** |
+| **Handle lists by asking the user to scroll** (scan visible rows, show "N found; scroll and scan again" and accumulate) | B (virtualised/infinite) | The user stays in control. Needs the panel to keep a running list per page. Suggested. **Not in plan.** |
+| **Highlight and right-click save** | Everything | Always works, even where nothing else does. Kept as the manual path. **Existing.** |
+| **Paste box** | Blocked pages, PDFs | The user copies text in. **Existing.** |
+| **Extract text from PDFs** (fetch the PDF URL and parse it with pdf.js, then use the same extractor) | C (PDFs) | Suggested. Needs a host permission for arbitrary URLs unless the PDF is opened in the tab and the user selects the text, so start with selection. **Not in plan.** |
+| **Use official data sources for people lookups** (LinkedIn data export CSV, Facebook "Download your information", a licensed enrichment provider) | E | For bulk or profile data that must not be scraped, import a user-supplied export or call a licensed API. A separate feature, not a scan. **Not in plan.** |
+
+## 3. What this means for the build
+
+- **Do not add more per-site rules.** The failures above are structural; rules cannot reach them.
+- **The plan already covers the biggest group:** unstable markup (A), late render (B, partly), iframes (C, subject to the
+  permission check), and spelled-out emails (D, via the model). Highlight and the paste box cover the rest as a manual fallback.
+- **Worth adding next, in this order:** (1) obfuscation decoding, (2) the "click Contact info, then scan again" hint,
+  (3) accumulate-while-scrolling for lists, (4) a screenshot fallback for image-only pages, (5) PDFs.
+- **Some things will not work and should say so clearly:** contact-form-only pages, details only visible to logged-in
+  connections the user does not have, and anything behind a login wall. The panel should state the reason (the plan's
+  typed failure reasons) instead of a generic error.
+
+
+---
+
+# Part 3: The extraction model service: build, cost, infrastructure
+
+Status: proposal, 2026-10-23. Companion to `docs/superpowers/specs/2026-10-23-model-extraction-design.md` (what it does)
+and `docs/superpowers/plans/2026-10-23-model-extraction.md` (task list). This document covers the **service side**: where
+the model runs, how the gate calls it, what it costs per scan and per month, and every change outside the extension code.
+
+Figures marked *assumption* are mine and must be replaced with real numbers before budgeting. Model prices are Anthropic's
+list prices as cached in the Claude API reference on 2026-10-06; confirm on the pricing page before committing a budget.
+
+---
+
+## 1. What the "model service" is
+
+There is **no new service to deploy.** The model service is a new capability inside the existing `grabber-gate` (ECS Fargate,
+Spring Boot, behind LookingGlass), which calls a hosted Claude model. The gate already authenticates the user, knows their
+plan, rate-limits, and counts usage; extraction reuses all of that.
+
+```mermaid
+flowchart LR
+  EXT["Extension\n(service worker)"] -->|"POST /v1/grabber/extract\nBearer token"| LG["LookingGlass\n(API gateway)"]
+  LG --> ALB["Internal ALB\neks-prod-internal"]
+  ALB --> GATE["grabber-gate (ECS Fargate)\n1. auth  2. rate limit  3. plan + daily quota\n4. build prompt  5. call model\n6. ground + sanitise  7. record usage"]
+  GATE -->|"HTTPS 443\nAPI key from Secrets Manager"| CLAUDE["Claude API\n(claude-haiku-5-5)"]
+  GATE --> DB[("Aurora contact_grabber\n2 small new tables:\ndaily counts + request ids")]
+  GATE --> OBS["StatsD / CloudWatch logs\ncounts and codes only"]
+```
+
+## 2. Which model, and why
+
+| Option | Input / output per 1M tokens | Notes |
+|---|---|---|
+| **Claude Haiku 5.5** (`claude-haiku-5-5`) | **$0.10 / $0.50** (prompts up to 100K tokens) | Built for high-volume extraction and classification. Our prompt never exceeds ~25K tokens. **Recommended.** |
+| Claude Sonnet 5.5 (`claude-sonnet-5-5`) | $2 / $10 | About 20x the cost. Use only if Haiku fails the corpus (plan Task 12) on messy pages. |
+| Claude Opus 5.5 (`claude-opus-5-5`) | $4 / $20 | About 40x. Not justified for this task. |
+
+**Decision rule:** build the corpus first, run Haiku, and move to Sonnet only for the classes of pages where Haiku measurably
+misses names or contacts. The model id is config (`grabbergate.extract.model`), so the change is an env var, not a deploy of new code.
+
+## 3. How the gate calls the model
+
+### 3.1 Use the official Anthropic Java SDK, not hand-written HTTP
+
+The plan's Task 7 sketched a hand-rolled `RestClient` call with forced tool use. Two corrections after checking the current API:
+
+1. **Use the official SDK** (`com.anthropic:anthropic-java`, `AnthropicOkHttpClient`). It handles retries, typed errors and request
+   building, and it is the supported path for Java.
+2. **Use structured outputs (`output_config.format` with a JSON schema), not forced `tool_choice`.** Forced tool choice is rejected
+   by Claude Opus 5.5 and Sonnet 5.5, and on Haiku 5.5 it skips thinking. Structured outputs work on every model, so switching
+   from Haiku to Sonnet later cannot break the call.
+
+### 3.2 Request shape (Haiku 5.5)
+
+| Setting | Value | Why |
+|---|---|---|
+| `model` | `claude-haiku-5-5` (config) | exact id, no date suffix |
+| `max_tokens` | 12,000 | Haiku 5.5 thinks by default and **thinking counts toward `max_tokens`**; a low cap ends the response before any text |
+| `output_config.effort` | `low` | extraction is not a reasoning task; this is the main output-cost lever |
+| `thinking` | leave unset (adaptive) | simplest; revisit `disabled` only if measurements show thinking tokens add cost without quality |
+| `output_config.format` | JSON schema: `{contacts:[{name,title,company,emails[],phones[],website,address,social[],evidence}]}` | guarantees parseable output; `evidence` is a quote used only for logging-free debugging and discarded |
+| `system` | the extraction prompt (a few hundred tokens) | includes the "page is untrusted data" rule |
+| `messages` | one user message: `<page>` block with `<dialog>`, `<text>`, `<links>`, `<structured>` | delimiters keep page text out of the instruction position |
+| `temperature`, `top_p`, `top_k` | **not sent** | Haiku 5.5 returns 400 for non-default values |
+| prefill | **not used** | rejected (400) |
+| client timeout / retries | 25 s / 1 retry | keeps the worst case under the gateway timeout (section 6) |
+
+Reading the response: iterate `content` blocks by `type` and take the `text` block (a response can start with `thinking`
+blocks). Check `stop_reason`: `max_tokens` means a truncated list (return what parsed, set `truncated: true`); `refusal` means
+treat as "nothing found" and log the category only (Haiku has no server-side fallback model).
+
+### 3.3 What the gate does around the call
+
+In order: kill switch → extract rate limit (own bucket) → empty-bundle short-circuit (no call, no charge) → plan lookup → daily
+quota check → **bulkhead** → model call → grounding check → sanitise → record usage on success. Details are in plan Tasks 5-8.
+
+New in this document (not yet in the plan):
+- **Bulkhead.** A Resilience4j bulkhead of 20 concurrent extractions. Model calls hold a request thread for 3-10 seconds; without
+  a cap, a burst of scans could use every Tomcat thread and block `POST /contacts` (saving). Over the cap returns 503 `unavailable`
+  and the extension falls back to the local scan.
+- **Gradual rollout flag.** `grabbergate.extract.rollout-percent` (0-100, default 0), compared against a stable hash of the
+  account id. Accounts outside it get the same empty response as the kill switch. Lets you go 0 → internal → 10 → 100 without redeploying.
+- **Token metrics.** Record `usage.input_tokens` and `usage.output_tokens` per call (numbers only) so spend can be graphed and alarmed.
+
+## 4. Cost
+
+### 4.1 Per-scan token profiles (*assumptions, from the bundle caps in the design*)
+
+Rough tokens: about 3 characters per token for mixed web text on the Haiku 5.5 tokenizer (about 30% more tokens than Haiku 4.5
+for the same text). Prompt and schema are about 1,700 tokens on every call.
+
+| Profile | What it is | Input tokens | Output tokens (incl. thinking) |
+|---|---|---|---|
+| **A. Typical** | profile or "contact us" page, a few KB of text | 5,000 | 800 |
+| **B. Heavy** | long page near the 40,000-character cap | 16,000 | 3,000 |
+| **C. Worst case** | cap reached, 50-contact directory, 8,000-character dialog | 22,000 | 9,000 |
+
+### 4.2 Cost per scan
+
+| Model | A. Typical | B. Heavy | C. Worst | Blended (70% A / 25% B / 5% C) |
+|---|---|---|---|---|
+| **Haiku 5.5** | $0.0009 | $0.0031 | $0.0067 | **$0.0017** |
+| Sonnet 5.5 | $0.018 | $0.062 | $0.134 | $0.035 |
+| Opus 5.5 | $0.036 | $0.124 | $0.268 | $0.070 |
+
+### 4.3 Monthly bill by active users (*assumption: 15 scans per active user per month*)
+
+| Active users / month | Scans / month | Haiku 5.5 | Sonnet 5.5 | Opus 5.5 |
+|---|---|---|---|---|
+| 1,000 | 15,000 | **$26** | $520 | $1,040 |
+| 10,000 | 150,000 | **$260** | $5,200 | $10,400 |
+| 50,000 | 750,000 | **$1,300** | $26,100 | $52,200 |
+
+### 4.4 The ceiling per account (what the quota protects)
+
+| Account | Scans / day cap | Haiku, every scan worst case | Haiku, typical |
+|---|---|---|---|
+| Free | 20 | $0.13 / day, **about $4 / month** | $0.02 / day, about $0.54 / month |
+| Paid | 200 | $1.34 / day, **about $40 / month** | $0.18 / day, about $5.40 / month |
+
+On Sonnet the same worst-case paid account would be about $800 / month, which is why the quota and the model choice go together.
+A runaway or abusive account cannot cost more than these ceilings, plus the per-minute rate limit.
+
+### 4.5 Ways to spend less (cheapest first)
+
+1. **Don't call the model when you don't need to.** Selections the local parser already reads, and empty or near-empty pages,
+   never reach it (already in the design).
+2. **Effort `low`**, and measure whether adaptive thinking helps at all on this task.
+3. **Per-tab result cache in the extension.** Hash the bundle; re-pressing Scan on an unchanged page reuses the stored result
+   (`chrome.storage.session`, never sent anywhere). Removes the most common waste: users scanning the same page twice.
+4. **Trim the input.** Drop duplicate links, empty frames, and boilerplate lines (footers repeated on every page) before sending.
+5. **Prompt caching: probably not worth it.** The reusable prefix is only about 1,700 tokens, near or under the minimum cacheable
+   size, and the saving is under $0.0002 per call at Haiku rates. Leave it off; check `usage.cache_read_input_tokens` if tried.
+6. **Batch API: not applicable.** It is for non-interactive work; scans wait for a person.
+
+### 4.6 Other running costs
+
+| Item | Cost (approximate, confirm with the AWS pricing calculator) |
+|---|---|
+| Fargate task, 0.5 vCPU / 1 GB, on-demand | about $18 / month per task (about $0.025 / hour); Spot is much cheaper but the service keeps 5% on-demand base |
+| Second task for availability (recommended at launch) | about +$18 / month |
+| Aurora (shared cluster) | negligible: two tables, under about 50,000 rows at steady state because rows older than 2 days are deleted |
+| ALB, NAT/egress data | small: requests are under 100 KB each, so even 750,000 scans is under about 75 GB / month outbound |
+| Logs and metrics | existing groups; counts only, so no meaningful growth |
+
+**Total at 10,000 active users: about $300 / month**, nearly all of it model usage.
+
+## 5. Where infrastructure changes
+
+### 5.1 Anthropic account (one-time, owner: whoever holds the account)
+
+- Create a **dedicated workspace** for Contact Grabber and an API key scoped to it, so spend is separable and revocable.
+- Set a **monthly spend limit** on that workspace below your pain threshold (for example 3x the expected bill) as a hard stop.
+- Confirm the **data retention and processing terms** for API inputs under your agreement, and put that wording in the privacy
+  policy (plan Task 13). Do not assume; the policy states what happens to page text at the provider.
+- Set usage alerts; the Admin API can report usage and cost for the workspace if you want a daily check.
+
+### 5.2 AWS (owner: platform / the person who deployed the gate)
+
+| Change | Detail |
+|---|---|
+| **Secret** | Store `ANTHROPIC_API_KEY` in AWS Secrets Manager (or SSM SecureString). The current task definition has no secrets and the database password is a committed default; **do not follow that pattern for an API key.** |
+| **Task definition** (`.github/workflows/grabber-gate-task-definition.json`) | Add `secrets: [{ name: "ANTHROPIC_API_KEY", valueFrom: "<secret arn>" }]` and environment `GRABBERGATE_EXTRACT_ENABLED`, `GRABBERGATE_EXTRACT_MODEL`, `GRABBERGATE_EXTRACT_ROLLOUT_PERCENT`, `GRABBERGATE_EXTRACT_FREE_PER_DAY`, `GRABBERGATE_EXTRACT_PAID_PER_DAY` |
+| **IAM** | `ecs-task-execution-role` (shared by the fleet) needs read access to that one secret. Prefer a resource-scoped statement, not a wildcard. The task role stays unchanged (the gate calls no AWS API). |
+| **Egress** | The task must reach `api.anthropic.com` on 443. Confirm the three subnets route to a NAT gateway (or equivalent) and the two security groups allow outbound 443. The gate's other calls go to internal ContactsPlus hosts, so this is **not** proven today; test from a task before launch. |
+| **Service sizing** | Raise desired count from 1 to **2** for availability. Keep 0.5 vCPU / 1 GB until measured; request bodies up to 256 KB at a concurrency of 20 are only a few MB. |
+| **ALB** | Idle timeout is 60 s by default, enough for a 25 s call. No change expected; verify. |
+
+### 5.3 LookingGlass (owner: gateway team; separate repository)
+
+- Add the route `POST` and `OPTIONS /v1/grabber/extract` → `grabber-gate.service.contactsplus.com:80`, authentication required
+  (same as the existing two routes).
+- **Check two limits there**: the maximum request body (must allow **256 KB**; the existing routes carry under 64 KB) and the
+  upstream timeout (must allow **at least 30 s**). These are the most likely thing to break in production and cannot be tested
+  from this repository.
+- CORS for the extension origin already works for the other routes; confirm it applies to the new route.
+
+### 5.4 Database (owner: whoever runs the one-time Liquibase step)
+
+- Apply changeset `0003-extraction-tables.yaml` (plan Task 5) using the existing one-run procedure in
+  `docs/gate/deploy-handoff.md` (Step B). Two tables: `grabber_extraction_day`, `grabber_extraction_request`. No page or contact content.
+- The runtime user already has `ALL PRIVILEGES` on `contact_grabber.*`, so no new grants. The 30-connection cap is unaffected.
+
+### 5.5 Monitoring and alerts
+
+Metrics to emit through the existing StatsD setup: calls, outcome code (`ok`, `empty`, `quota`, `rate_limited`, `disabled`,
+`model_error`, `refusal`, `truncated`), latency, input and output tokens, fields dropped by grounding. Alerts: model error rate over
+5% for 10 minutes; p95 latency over 15 s; daily output tokens over 2x the 7-day average; any day over the monthly budget / 30.
+**The grounding drop rate is the quality signal:** a sudden rise means the prompt or the model changed behaviour.
+
+## 6. Build plan and phases
+
+Rough effort is for one engineer who knows the repository (*estimates, not commitments*).
+
+| Phase | What | Where | Gate to the next phase | Effort |
+|---|---|---|---|---|
+| 0 | Spike: cross-origin iframe access with `activeTab` (plan Task 1); decide the Anthropic account and secret ownership | extension, owners | iframe answer recorded | 0.5 day |
+| 1 | Corpus: collect saved real pages and expected contacts (plan Task 12, first half) | tests | corpus of 15+ pages including LinkedIn and Facebook | 1-2 days (owner supplies pages) |
+| 2 | Gate core: quota tables, grounding checker, model client (official SDK + structured outputs), service, endpoint, bulkhead, rollout flag (plan Tasks 5-8) | `gate/` | all gate tests green; live run of the corpus against Haiku meets the target | 4-5 days |
+| 3 | Extension: shared types, frame collector, API call, smart scan, consent and panel (plan Tasks 2-4, 9-11) | `src/` | extension tests and e2e green against the stub gate | 5-6 days |
+| 4 | Infra: secret, task definition, egress check, LookingGlass route and limits, Liquibase run | AWS, gateway repo | a staged call from the extension to the real gate returns grounded contacts | 1-2 days, depends on other teams |
+| 5 | Rollout: internal accounts → 10% → 100% by flag; watch grounding drops, cost per scan, error rate | config only | no alert for a week at each step | 2-3 weeks calendar |
+| 6 | Store: privacy policy, store listing and review notes (plan Task 13), version release | docs, store | store review passed | review time |
+
+The long poles are other teams (LookingGlass limits, secret and IAM changes) and the Web Store review, not code.
+
+## 7. Risks and what to do about them
+
+| Risk | Mitigation |
+|---|---|
+| Model invents a phone or email | Server-side grounding check drops any field not on the page; zero ungrounded fields is a release gate |
+| Cost surprise | Per-account daily quota, per-minute rate limit, input and output caps, workspace spend limit, daily spend alert, kill switch |
+| Page text contains instructions | Page is wrapped as untrusted data; output is schema-constrained and grounded; no tools are given to the model, so it cannot act on anything |
+| Provider outage or rate limit | Bulkhead and 25 s timeout; 503 makes the extension show local results with a note; kill switch |
+| Slow responses annoy users | Haiku at low effort; target p95 under 8 s; progress line and Cancel in the panel |
+| Privacy objections | One-time consent screen, no storage of page text, counts-only logs, policy and store disclosure updated before release |
+| Haiku not accurate enough | Measure on the corpus; move specific page classes to Sonnet 5.5 through the model config; cost goes up about 20x for those only |
+| Gateway or egress limits discovered late | Phase 4 checks them with a real call before any code is released |
+
+## 8. Alternative: run the model through Amazon Bedrock
+
+Claude Haiku 5.5 is also served on Amazon Bedrock (`anthropic.claude-haiku-5-5`), and the Java SDK has a Bedrock client
+(`BedrockMantleBackend`). That would replace the API key and the internet egress with the task role's IAM permissions, keep the
+traffic inside the AWS account, and bill through AWS. Costs of this option:
+
+- Bedrock has its own pricing page and its own feature availability; I have not priced it here. Compare it before choosing.
+- The task role (`eks-production-svc-grabber-gate`) needs Bedrock invoke permissions; today it has none.
+- It is a swap behind the `ExtractModelClient` interface (plan Task 7), so it can be done later without touching the rest.
+
+**Recommendation:** start with the direct Claude API (simplest, features known, prices known), keep the interface so Bedrock is a
+later option if security or procurement prefers it.
+
+## 9. Changes to the existing plan
+
+These follow from this document and have been applied to the plan (`docs/superpowers/plans/2026-10-23-model-extraction.md`).
+
+1. **Task 7:** use the official Java SDK and structured outputs instead of a hand-rolled `RestClient` and forced `tool_choice`;
+   set `max_tokens` 12,000, effort `low`, no sampling parameters; read content by block type; handle `max_tokens` and `refusal`.
+2. **Task 8:** add the bulkhead (20 concurrent) and the `rollout-percent` flag; record token counts as metrics.
+3. **Task 10 (extension):** add the per-tab result cache keyed by bundle hash.
+4. **Task 13:** add the secret, IAM, egress, LookingGlass limits and alert steps from section 5, and the Anthropic workspace and
+   spend-limit setup, as a launch checklist.
+
+## 10. Decisions needed
+
+1. Direct Claude API now (recommended) or Bedrock?
+2. Daily quotas: 20 free / 200 paid are placeholders.
+3. Monthly spend ceiling for the Anthropic workspace.
+4. Who owns the Anthropic account and key, and who changes LookingGlass and IAM.
+5. Real active-user and scans-per-user figures, so section 4.3 can be replaced with real numbers.
+</script>
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10.9.1/dist/mermaid.min.js"></script>
+<script>
+try{
+  const md=document.getElementById('src').textContent;
+  const out=document.getElementById('out');
+  out.innerHTML=marked.parse(md);
+  out.querySelectorAll('pre code.language-mermaid').forEach(c=>{
+    const d=document.createElement('div');d.className='mermaid';d.textContent=c.textContent;c.parentElement.replaceWith(d);});
+  const dark=matchMedia('(prefers-color-scheme: dark)').matches;
+  mermaid.initialize({startOnLoad:false,theme:dark?'dark':'default',securityLevel:'strict'});
+  mermaid.run({querySelector:'.mermaid'});
+}catch(e){document.getElementById('out').innerHTML='<p id="err">Could not render: '+e.message+'. Open the .md file instead.</p>';}
+</script></body></html>
